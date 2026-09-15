@@ -31,6 +31,7 @@ if sys.path and Path(sys.path[0]).resolve() == _SCRIPT_DIR:
 
 DEFAULT_TRACE_DIR = "/tmp/dsv4-indexer-trace"
 LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
+CONTAINER_PATH_MARKER = "__DSV4_ATTENTION_DIR__="
 
 
 def escape(value: str) -> str:
@@ -57,9 +58,17 @@ def source_files() -> tuple[Path, Path]:
 
 def container_attention_dir(container: str) -> str:
     code = (
-        "from pathlib import Path; import vllm_ascend; print(Path(vllm_ascend.__file__).resolve().parent / 'attention')"
+        "import importlib.util; from pathlib import Path; "
+        "spec = importlib.util.find_spec('vllm_ascend'); "
+        "assert spec is not None and spec.submodule_search_locations; "
+        f"print('{CONTAINER_PATH_MARKER}' + "
+        "str(Path(next(iter(spec.submodule_search_locations))).resolve() / 'attention'))"
     )
-    return run_command(["docker", "exec", container, "python", "-c", code], capture=True)
+    output = run_command(["docker", "exec", container, "python", "-c", code], capture=True)
+    for line in output.splitlines():
+        if line.startswith(CONTAINER_PATH_MARKER):
+            return line.removeprefix(CONTAINER_PATH_MARKER).strip()
+    raise RuntimeError(f"Could not locate vllm_ascend/attention in container {container}. Output: {output}")
 
 
 def patch_container(container: str) -> None:
