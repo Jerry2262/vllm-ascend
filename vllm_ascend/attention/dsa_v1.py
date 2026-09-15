@@ -18,6 +18,7 @@ from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.abstract import DSAAttentionImpl
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.attention.indexer_trace import DSV4IndexerTrace
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
     maybe_save_kv_layer_to_connector,
@@ -1516,6 +1517,21 @@ class AscendDSAImpl(DSAAttentionImpl):
         ascend_config = get_ascend_config()
         self.multistream_dsv4_dsa_overlap = ascend_config.multistream_dsv4_dsa_overlap
         self.vllm_config = get_current_vllm_config()
+        self.indexer_trace = DSV4IndexerTrace.from_vllm_config(self.vllm_config)
+        self._active_layer_name = ""
+        if self.indexer_trace.requested:
+            if self.multistream_dsv4_dsa_overlap:
+                raise ValueError(
+                    "DeepSeek-V4 indexer tracing requires additional_config.multistream_dsv4_dsa_overlap=false."
+                )
+            if not self.vllm_config.model_config.enforce_eager:
+                raise ValueError("DeepSeek-V4 indexer tracing requires --enforce-eager.")
+            if self.vllm_config.scheduler_config.max_num_seqs != 1:
+                raise ValueError("DeepSeek-V4 indexer tracing requires --max-num-seqs 1.")
+            if self.vllm_config.speculative_config is not None:
+                raise ValueError("DeepSeek-V4 indexer tracing requires speculative decoding to be disabled.")
+            if getattr(self.vllm_config.model_config.hf_config, "use_index_cache", False):
+                raise ValueError("DeepSeek-V4 indexer tracing requires use_index_cache=false.")
 
         # indexer param
         if self.indexer is not None:
@@ -1768,6 +1784,7 @@ class AscendDSAImpl(DSAAttentionImpl):
         output: torch.Tensor | None = None,
     ) -> torch.Tensor:
         assert output is not None, "Output tensor must be provided."
+        self._active_layer_name = layer_name
         output_padded = output
         forward_context = get_forward_context()
         o_proj_input_shape = (forward_context.num_tokens, self.n_local_heads, self.head_dim)
@@ -2729,12 +2746,15 @@ class AscendDSAImpl(DSAAttentionImpl):
             block_table = indexer_kv_scale_metadata.decode.block_table
             qli_metadata = indexer_kv_scale_metadata.decode.qli_metadata
 
+        indexer_weights = DeviceOperator.prepare_dsa_indexer_weights(weights)
+        query_scale = DeviceOperator.prepare_dsa_indexer_query_scale(q_scale)
+        key_scale_cache = DeviceOperator.prepare_dsa_indexer_key_scale(indexer_scale_cache)
         topk_idxs, _ = torch.ops._C_ascend.npu_vllm_quant_lightning_indexer(
             query=q,
             key=indexer_k_cache,
-            weights=DeviceOperator.prepare_dsa_indexer_weights(weights),
-            query_dequant_scale=DeviceOperator.prepare_dsa_indexer_query_scale(q_scale),
-            key_dequant_scale=DeviceOperator.prepare_dsa_indexer_key_scale(indexer_scale_cache),
+            weights=indexer_weights,
+            query_dequant_scale=query_scale,
+            key_dequant_scale=key_scale_cache,
             actual_seq_lengths_query=qlens,
             actual_seq_lengths_key=kvlens,
             block_table=block_table,
@@ -2750,6 +2770,19 @@ class AscendDSAImpl(DSAAttentionImpl):
             cmp_ratio=4,
             return_value=False,
         )
+        if not with_prefill:
+            self.indexer_trace.record_decode(
+                layer_name=self._active_layer_name,
+                topk_indices=topk_idxs,
+                query=q,
+                key_cache=indexer_k_cache,
+                weights=indexer_weights,
+                query_scale=query_scale,
+                key_scale_cache=key_scale_cache,
+                block_table=block_table,
+                seq_lens=kvlens,
+                compress_ratio=4,
+            )
         return topk_idxs
 
     def indexer_select_qli(
