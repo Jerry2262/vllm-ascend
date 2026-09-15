@@ -150,6 +150,8 @@ def launch_arguments(trace_dir: str, layers: list[int]) -> list[str]:
     if layers:
         trace_config["layers"] = layers
     additional_config = {
+        "enable_dsa_cp": False,
+        "multistream_overlap_shared_expert": False,
         "multistream_dsv4_dsa_overlap": False,
         "dsv4_indexer_trace": trace_config,
     }
@@ -313,6 +315,8 @@ def write_csv(records: list[dict[str, Any]], path: Path) -> None:
         "std_selected",
         "cutoff_over_top1",
         "wall_time_ns",
+        "data_parallel_rank",
+        "tensor_parallel_rank",
         "rank",
         "pid",
     ]

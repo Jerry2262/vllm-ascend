@@ -67,7 +67,9 @@ def test_trace_writes_cutoff_statistics(tmp_path):
         compress_ratio=4,
     )
 
-    record = json.loads((tmp_path / "indexer-trace-rank0.jsonl").read_text())
+    record = json.loads((tmp_path / "indexer-trace-dp0-rank0.jsonl").read_text())
+    assert record["data_parallel_rank"] == 0
+    assert record["tensor_parallel_rank"] == 0
     assert record["context_len"] == 9
     assert record["compressed_len"] == 2
     assert record["valid_selected"] == 2

@@ -18,6 +18,7 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
+from vllm.distributed import get_tensor_model_parallel_rank
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -95,7 +96,7 @@ def compute_selected_indexer_scores(
 class DSV4IndexerTrace:
     """Write per-decode, per-layer indexer threshold statistics as JSONL."""
 
-    def __init__(self, config: dict[str, Any] | None):
+    def __init__(self, config: dict[str, Any] | None, data_parallel_rank: int = 0):
         config = config or {}
         self.requested = bool(config.get("enabled", False))
         self.enabled = self.requested
@@ -106,7 +107,15 @@ class DSV4IndexerTrace:
         self._decode_calls = 0
 
         self.rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
-        if self.rank != 0:
+        self.data_parallel_rank = data_parallel_rank
+        if dist.is_available() and dist.is_initialized():
+            try:
+                self.tensor_parallel_rank = get_tensor_model_parallel_rank()
+            except AssertionError:
+                self.tensor_parallel_rank = self.rank
+        else:
+            self.tensor_parallel_rank = 0
+        if self.tensor_parallel_rank != 0:
             self.enabled = False
         if self.enabled:
             self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -114,7 +123,10 @@ class DSV4IndexerTrace:
     @classmethod
     def from_vllm_config(cls, vllm_config) -> "DSV4IndexerTrace":
         additional_config = vllm_config.additional_config or {}
-        return cls(additional_config.get("dsv4_indexer_trace"))
+        return cls(
+            additional_config.get("dsv4_indexer_trace"),
+            data_parallel_rank=vllm_config.parallel_config.data_parallel_rank,
+        )
 
     def _layer_is_enabled(self, layer_name: str) -> bool:
         if not self.layers:
@@ -186,6 +198,8 @@ class DSV4IndexerTrace:
                 "wall_time_ns": time.time_ns(),
                 "pid": os.getpid(),
                 "rank": self.rank,
+                "data_parallel_rank": self.data_parallel_rank,
+                "tensor_parallel_rank": self.tensor_parallel_rank,
                 "layer": layer_name,
                 "decode_call": self._decode_calls,
                 "context_len": int(context_len_value),
@@ -202,7 +216,7 @@ class DSV4IndexerTrace:
                     cutoff_value / top1_value if math.isfinite(top1_value) and abs(top1_value) > 1e-12 else None
                 ),
             }
-            output_path = self.output_dir / f"indexer-trace-rank{self.rank}.jsonl"
+            output_path = self.output_dir / (f"indexer-trace-dp{self.data_parallel_rank}-rank{self.rank}.jsonl")
             with output_path.open("a", encoding="utf-8") as output_file:
                 output_file.write(json.dumps(record, ensure_ascii=False) + "\n")
         except Exception:
